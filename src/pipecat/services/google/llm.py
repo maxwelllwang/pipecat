@@ -979,8 +979,8 @@ class GoogleLLMService(LLMService):
         adapter = self.get_llm_adapter()
         params: GeminiLLMInvocationParams = adapter.get_llm_invocation_params(context)
 
-        logger.debug(
-            f"{self}: Generating chat from universal context [{params['system_instruction']}] | {adapter.get_messages_for_logging(context)}"
+        print(
+            f"{self}: Generating chat from universal context [{params['system_instruction']}] | {json.dumps(adapter.get_messages_for_logging(context), indent=2)}"
         )
 
         return await self._stream_content(params)
@@ -1167,6 +1167,17 @@ class GoogleLLMService(LLMService):
                     rendered_content=grounding_metadata["rendered_content"],
                 )
                 await self.push_frame(llm_search_frame)
+
+            # Log cache usage in human-readable format
+            if cache_read_input_tokens > 0:
+                cache_percentage = (cache_read_input_tokens / prompt_tokens * 100) if prompt_tokens > 0 else 0
+                print(
+                    f"💾 Gemini Cache Stats: {cache_read_input_tokens:,} cached tokens "
+                    f"({cache_percentage:.1f}% of {prompt_tokens:,} prompt tokens) - "
+                    f"Est. savings: {cache_read_input_tokens * 0.9 / 1000:.4f}k tokens worth"
+                )
+            else:
+                print(f"📊 Gemini Token Usage: {prompt_tokens:,} prompt, {completion_tokens:,} completion, {total_tokens:,} total (no cache hit)")
 
             await self.start_llm_usage_metrics(
                 LLMTokenUsage(
