@@ -12,10 +12,14 @@ LLM processing, and text-to-speech components in conversational AI pipelines.
 """
 
 import asyncio
+import os
 import warnings
 from abc import abstractmethod
+from collections import deque
 from dataclasses import dataclass
 from typing import Dict, List, Literal, Optional, Set
+import datetime
+import time
 
 from loguru import logger
 
@@ -54,6 +58,9 @@ from pipecat.frames.frames import (
     UserImageRawFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
+    ImageContextRawFrame,
+    OutputImageRawFrame,
+    InputImageRawFrame,
 )
 from pipecat.processors.aggregators.openai_llm_context import (
     OpenAILLMContext,
@@ -61,6 +68,7 @@ from pipecat.processors.aggregators.openai_llm_context import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.utils.time import time_now_iso8601
+import copy
 
 
 @dataclass
@@ -81,11 +89,17 @@ class LLMUserAggregatorParams:
         enable_emulated_vad_interruptions: When True, allows emulated VAD events
             to interrupt the bot when it's speaking. When False, emulated speech
             is ignored while the bot is speaking.
+        frame_capture_interval: Capture every Nth InputImageRawFrame for the frame queue.
+            Default is 10, meaning every 10th frame is captured.
+        frame_queue_size: Maximum number of frames to keep in the frame queue.
+            Default is 3. When the queue is full, oldest frames are removed.
     """
 
     aggregation_timeout: float = 0.5
     turn_emulated_vad_timeout: float = 0.8
     enable_emulated_vad_interruptions: bool = False
+    frame_capture_interval: int = 10
+    frame_queue_size: int = 3
 
 
 @dataclass
@@ -489,6 +503,13 @@ class LLMUserContextAggregator(LLMContextResponseAggregator):
         self._aggregation_event = asyncio.Event()
         self._aggregation_task = None
 
+        self.latest_cached_frame = None
+        
+        # Separate frame queue for capturing every Nth frame
+        self._frame_counter = 0
+        self._frame_queue = deque(maxlen=self._params.frame_queue_size)
+
+
     async def reset(self):
         """Reset the aggregation state and interruption strategies."""
         await super().reset()
@@ -560,11 +581,89 @@ class LLMUserContextAggregator(LLMContextResponseAggregator):
             self._vad_params = frame.vad_params
             self._turn_params = frame.turn_params
             await self.push_frame(frame, direction)
+        elif isinstance(frame, InputImageRawFrame):
+            self.latest_cached_frame = frame
+            
+            # Update frame counter and queue
+            self._frame_counter += 1
+            if self._frame_counter % self._params.frame_capture_interval == 0:
+                frame.metadata = {"timestamp": time.time()}  # Store as Unix timestamp (float)
+                self._frame_queue.append(frame)
         else:
             await self.push_frame(frame, direction)
 
     async def _process_aggregation(self):
         """Process the current aggregation and push it downstream."""
+        # Check if image erasure is disabled via environment variable
+        disable_image_erasure = os.environ.get("DISABLE_IMAGE_ERASURE", "").lower() == "true"
+
+        if not disable_image_erasure:
+            msgs = []
+            for message in self._context.messages:
+                msg = copy.deepcopy(message)
+                has_image = False
+
+                # Check for Google LLM format - Content objects with 'parts' attribute
+                if hasattr(msg, 'parts') and isinstance(msg.parts, list):
+                    # Check if this message contains any images - if so, skip the entire message
+                    for part in msg.parts:
+                        if hasattr(part, 'inline_data') and part.inline_data:
+                            mime_type = getattr(part.inline_data, 'mime_type', '')
+                            if mime_type and mime_type.startswith("image/"):
+                                has_image = True
+                                break
+                        elif isinstance(part, dict) and "inline_data" in part:
+                            if isinstance(part["inline_data"], dict):
+                                mime_type = part["inline_data"].get("mime_type", "")
+                                if mime_type and mime_type.startswith("image/"):
+                                    has_image = True
+                                    break
+                # Check for Google LLM format with 'parts' array (dict format)
+                elif "parts" in msg and isinstance(msg["parts"], list):
+                    # Check if this message contains any images - if so, skip the entire message
+                    has_image = any(
+                        isinstance(part, dict) and
+                        "inline_data" in part and
+                        isinstance(part["inline_data"], dict) and
+                        part["inline_data"].get("mime_type", "").startswith("image/")
+                        for part in msg["parts"]
+                    )
+                # Check for OpenAI format with content as list
+                elif "content" in msg and isinstance(msg["content"], list):
+                    # Check if this message contains any images - if so, skip the entire message
+                    # OpenAI format: {"type": "image_url", "image_url": {"url": "..."}}
+                    has_image = any(
+                        isinstance(item, dict) and (
+                            item.get("type") == "image_url" or
+                            ("mime_type" in item and item["mime_type"].startswith("image/"))
+                        )
+                        for item in msg["content"]
+                    )
+                # Check for simple mime_type at message level
+                elif "mime_type" in msg and msg["mime_type"].startswith("image/"):
+                    has_image = True
+
+                # Only add messages that don't have image content
+                if not has_image:
+                    msgs.append(msg)
+
+            self._context.set_messages(msgs)
+
+
+
+    
+        image_prompt = "[SYSTEM] if the user wants information about what the drone sees or whats in the image, use this image as context. If the user doesn't reference the image or what the drone sees, ignore it completely and just do as the user asks"
+        # if self.latest_cached_frame and any(sub in self._aggregation.lower() for sub in vision_substrings) :
+        if self.latest_cached_frame:
+            self._context.add_image_frame_message(
+                format=self.latest_cached_frame.format,
+                size=self.latest_cached_frame.size,
+                image=self.latest_cached_frame.image,
+                text=image_prompt,
+            )
+        self.latest_cached_frame = None
+
+
         aggregation = self._aggregation
         await self.reset()
         await self.handle_aggregation(aggregation)
@@ -1158,3 +1257,4 @@ class LLMAssistantResponseAggregator(LLMAssistantContextAggregator):
 
             frame = LLMMessagesFrame(self._context.messages)
             await self.push_frame(frame)
+

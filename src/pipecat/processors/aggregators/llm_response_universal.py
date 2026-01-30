@@ -12,9 +12,13 @@ LLM processing, and text-to-speech components in conversational AI pipelines.
 """
 
 import asyncio
+import copy
 import json
+import os
+import time
 import warnings
 from abc import abstractmethod
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Set, Type
 
@@ -31,6 +35,7 @@ from pipecat.frames.frames import (
     FunctionCallResultFrame,
     FunctionCallsStartedFrame,
     InputAudioRawFrame,
+    InputImageRawFrame,
     InterimTranscriptionFrame,
     InterruptionFrame,
     LLMContextAssistantTimestampFrame,
@@ -85,12 +90,18 @@ class LLMUserAggregatorParams:
             If set, the aggregator will emit an `on_user_turn_idle` event when the user
             has been idle (not speaking) for this duration. Set to None to disable
             idle detection.
+        frame_capture_interval: Capture every Nth InputImageRawFrame for the frame queue.
+            Default is 10, meaning every 10th frame is captured.
+        frame_queue_size: Maximum number of frames to keep in the frame queue.
+            Default is 3. When the queue is full, oldest frames are removed.
     """
 
     user_turn_strategies: Optional[UserTurnStrategies] = None
     user_mute_strategies: List[BaseUserMuteStrategy] = field(default_factory=list)
     user_turn_stop_timeout: float = 5.0
     user_idle_timeout: Optional[float] = None
+    frame_capture_interval: int = 10
+    frame_queue_size: int = 3
 
 
 @dataclass
@@ -353,6 +364,11 @@ class LLMUserAggregator(LLMContextAggregator):
         self._register_event_handler("on_user_mute_started")
         self._register_event_handler("on_user_mute_stopped")
 
+        # Frame caching for video input
+        self.latest_cached_frame = None
+        self._frame_counter = 0
+        self._frame_queue = deque(maxlen=self._params.frame_queue_size)
+
         user_turn_strategies = self._params.user_turn_strategies or UserTurnStrategies()
 
         self._user_is_muted = False
@@ -434,6 +450,14 @@ class LLMUserAggregator(LLMContextAggregator):
             self.set_tool_choice(frame.tool_choice)
         elif isinstance(frame, SpeechControlParamsFrame):
             await self._handle_speech_control_params(frame)
+        elif isinstance(frame, InputImageRawFrame):
+            self.latest_cached_frame = frame
+
+            # Update frame counter and queue
+            self._frame_counter += 1
+            if self._frame_counter % self._params.frame_capture_interval == 0:
+                frame.metadata = {"timestamp": time.time()}  # Store as Unix timestamp (float)
+                self._frame_queue.append(frame)
         else:
             await self.push_frame(frame, direction)
 
@@ -446,6 +470,75 @@ class LLMUserAggregator(LLMContextAggregator):
         """Push the current aggregation."""
         if len(self._aggregation) == 0:
             return ""
+
+        # Check if image erasure is disabled via environment variable
+        disable_image_erasure = os.environ.get("DISABLE_IMAGE_ERASURE", "").lower() == "true"
+
+        if not disable_image_erasure:
+            # Filter out messages with images from history
+            msgs = []
+            for message in self._context.get_messages():
+                msg = copy.deepcopy(message)
+                has_image = False
+
+                # Check for Google LLM format - Content objects with 'parts' attribute
+                if hasattr(msg, 'parts') and isinstance(msg.parts, list):
+                    # Check if this message contains any images - if so, skip the entire message
+                    for part in msg.parts:
+                        if hasattr(part, 'inline_data') and part.inline_data:
+                            mime_type = getattr(part.inline_data, 'mime_type', '')
+                            if mime_type and mime_type.startswith("image/"):
+                                has_image = True
+                                break
+                        elif isinstance(part, dict) and "inline_data" in part:
+                            if isinstance(part["inline_data"], dict):
+                                mime_type = part["inline_data"].get("mime_type", "")
+                                if mime_type and mime_type.startswith("image/"):
+                                    has_image = True
+                                    break
+                # Check for Google LLM format with 'parts' array (dict format)
+                elif isinstance(msg, dict) and "parts" in msg and isinstance(msg["parts"], list):
+                    # Check if this message contains any images - if so, skip the entire message
+                    has_image = any(
+                        isinstance(part, dict) and
+                        "inline_data" in part and
+                        isinstance(part["inline_data"], dict) and
+                        part["inline_data"].get("mime_type", "").startswith("image/")
+                        for part in msg["parts"]
+                    )
+                # Check for OpenAI format with content as list
+                elif isinstance(msg, dict) and "content" in msg and isinstance(msg["content"], list):
+                    # Check if this message contains any images - if so, skip the entire message
+                    # OpenAI format: {"type": "image_url", "image_url": {"url": "..."}}
+                    has_image = any(
+                        isinstance(item, dict) and (
+                            item.get("type") == "image_url" or
+                            ("mime_type" in item and item["mime_type"].startswith("image/"))
+                        )
+                        for item in msg["content"]
+                    )
+                # Check for simple mime_type at message level
+                elif isinstance(msg, dict) and "mime_type" in msg and msg["mime_type"].startswith("image/"):
+                    has_image = True
+
+                # Only add messages that don't have image content
+                if not has_image:
+                    msgs.append(msg)
+
+            self._context.set_messages(msgs)
+
+        # Add cached image frame to context if available
+        image_prompt = "[SYSTEM] if the user wants information about what the drone sees or whats in the image, use this image as context. If the user doesn't reference the image or what the drone sees, ignore it completely and just do as the user asks"
+        if self.latest_cached_frame:
+            await self._context.add_image_frame_message(
+                format=self.latest_cached_frame.format,
+                size=self.latest_cached_frame.size,
+                image=self.latest_cached_frame.image,
+                text=image_prompt,
+            )
+
+            print("added image frame to context")
+        self.latest_cached_frame = None
 
         aggregation = self.aggregation_string()
         await self.reset()

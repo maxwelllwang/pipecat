@@ -328,7 +328,7 @@ class LLMService(AIService):
         handler: Any,
         start_callback=None,
         *,
-        cancel_on_interruption: bool = True,
+        cancel_on_interruption: bool = False,
     ):
         """Register a function handler for LLM function calls.
 
@@ -596,14 +596,12 @@ class LLMService(AIService):
             cancel_on_interruption=item.cancel_on_interruption,
         )
 
-        callback_executed = False
-
         # Define a callback function that pushes a FunctionCallResultFrame upstream & downstream.
+        # NOTE: The callback can be called later (e.g., after async MQTT response),
+        # so we don't auto-call it when the handler returns.
         async def function_call_result_callback(
             result: Any, *, properties: Optional[FunctionCallResultProperties] = None
         ):
-            nonlocal callback_executed
-            callback_executed = True
             await self.broadcast_frame(
                 FunctionCallResultFrame,
                 function_name=runner_item.function_name,
@@ -653,9 +651,6 @@ class LLMService(AIService):
             error_message = f"Error executing function call [{runner_item.function_name}]: {e}"
             logger.error(f"{self} {error_message}")
             await self.push_error(error_msg=error_message, exception=e, fatal=False)
-        finally:
-            if not callback_executed:
-                await function_call_result_callback(None)
 
     async def _cancel_function_call(self, function_name: Optional[str]):
         cancelled_tasks = set()
