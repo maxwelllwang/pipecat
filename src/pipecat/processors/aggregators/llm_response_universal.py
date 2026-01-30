@@ -13,8 +13,10 @@ LLM processing, and text-to-speech components in conversational AI pipelines.
 
 import asyncio
 import json
+import time
 import warnings
 from abc import abstractmethod
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Set, Type
 
@@ -31,6 +33,7 @@ from pipecat.frames.frames import (
     FunctionCallResultFrame,
     FunctionCallsStartedFrame,
     InputAudioRawFrame,
+    InputImageRawFrame,
     InterimTranscriptionFrame,
     InterruptionFrame,
     LLMContextAssistantTimestampFrame,
@@ -85,12 +88,18 @@ class LLMUserAggregatorParams:
             If set, the aggregator will emit an `on_user_turn_idle` event when the user
             has been idle (not speaking) for this duration. Set to None to disable
             idle detection.
+        frame_capture_interval: Capture every Nth InputImageRawFrame for the frame queue.
+            Default is 10, meaning every 10th frame is captured.
+        frame_queue_size: Maximum number of frames to keep in the frame queue.
+            Default is 3. When the queue is full, oldest frames are removed.
     """
 
     user_turn_strategies: Optional[UserTurnStrategies] = None
     user_mute_strategies: List[BaseUserMuteStrategy] = field(default_factory=list)
     user_turn_stop_timeout: float = 5.0
     user_idle_timeout: Optional[float] = None
+    frame_capture_interval: int = 10
+    frame_queue_size: int = 3
 
 
 @dataclass
@@ -353,6 +362,11 @@ class LLMUserAggregator(LLMContextAggregator):
         self._register_event_handler("on_user_mute_started")
         self._register_event_handler("on_user_mute_stopped")
 
+        # Frame caching for video input
+        self.latest_cached_frame = None
+        self._frame_counter = 0
+        self._frame_queue = deque(maxlen=self._params.frame_queue_size)
+
         user_turn_strategies = self._params.user_turn_strategies or UserTurnStrategies()
 
         self._user_is_muted = False
@@ -434,6 +448,14 @@ class LLMUserAggregator(LLMContextAggregator):
             self.set_tool_choice(frame.tool_choice)
         elif isinstance(frame, SpeechControlParamsFrame):
             await self._handle_speech_control_params(frame)
+        elif isinstance(frame, InputImageRawFrame):
+            self.latest_cached_frame = frame
+
+            # Update frame counter and queue
+            self._frame_counter += 1
+            if self._frame_counter % self._params.frame_capture_interval == 0:
+                frame.metadata = {"timestamp": time.time()}  # Store as Unix timestamp (float)
+                self._frame_queue.append(frame)
         else:
             await self.push_frame(frame, direction)
 
@@ -446,6 +468,17 @@ class LLMUserAggregator(LLMContextAggregator):
         """Push the current aggregation."""
         if len(self._aggregation) == 0:
             return ""
+
+        # Add cached image frame to context if available
+        image_prompt = "[SYSTEM] if the user wants information about what the drone sees or whats in the image, use this image as context. If the user doesn't reference the image or what the drone sees, ignore it completely and just do as the user asks"
+        if self.latest_cached_frame:
+            await self._context.add_image_frame_message(
+                format=self.latest_cached_frame.format,
+                size=self.latest_cached_frame.size,
+                image=self.latest_cached_frame.image,
+                text=image_prompt,
+            )
+        self.latest_cached_frame = None
 
         aggregation = self.aggregation_string()
         await self.reset()
