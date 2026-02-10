@@ -476,56 +476,82 @@ class LLMUserAggregator(LLMContextAggregator):
 
         if not disable_image_erasure:
             # Filter out messages with images from history
+            original_messages = self._context.get_messages()
+            original_count = len(original_messages)
             msgs = []
-            for message in self._context.get_messages():
-                msg = copy.deepcopy(message)
-                has_image = False
 
-                # Check for Google LLM format - Content objects with 'parts' attribute
-                if hasattr(msg, 'parts') and isinstance(msg.parts, list):
-                    # Check if this message contains any images - if so, skip the entire message
-                    for part in msg.parts:
-                        if hasattr(part, 'inline_data') and part.inline_data:
-                            mime_type = getattr(part.inline_data, 'mime_type', '')
-                            if mime_type and mime_type.startswith("image/"):
-                                has_image = True
-                                break
-                        elif isinstance(part, dict) and "inline_data" in part:
-                            if isinstance(part["inline_data"], dict):
-                                mime_type = part["inline_data"].get("mime_type", "")
+            try:
+                for message in original_messages:
+                    try:
+                        msg = copy.deepcopy(message)
+                    except Exception as e:
+                        # If deep copy fails, keep the original message to avoid data loss
+                        logger.warning(f"Failed to deep copy message during image erasure: {e}")
+                        msgs.append(message)
+                        continue
+
+                    has_image = False
+
+                    # Check for Google LLM format - Content objects with 'parts' attribute
+                    if hasattr(msg, 'parts') and isinstance(msg.parts, list):
+                        # Check if this message contains any images - if so, skip the entire message
+                        for part in msg.parts:
+                            if hasattr(part, 'inline_data') and part.inline_data:
+                                mime_type = getattr(part.inline_data, 'mime_type', '')
                                 if mime_type and mime_type.startswith("image/"):
                                     has_image = True
                                     break
-                # Check for Google LLM format with 'parts' array (dict format)
-                elif isinstance(msg, dict) and "parts" in msg and isinstance(msg["parts"], list):
-                    # Check if this message contains any images - if so, skip the entire message
-                    has_image = any(
-                        isinstance(part, dict) and
-                        "inline_data" in part and
-                        isinstance(part["inline_data"], dict) and
-                        part["inline_data"].get("mime_type", "").startswith("image/")
-                        for part in msg["parts"]
-                    )
-                # Check for OpenAI format with content as list
-                elif isinstance(msg, dict) and "content" in msg and isinstance(msg["content"], list):
-                    # Check if this message contains any images - if so, skip the entire message
-                    # OpenAI format: {"type": "image_url", "image_url": {"url": "..."}}
-                    has_image = any(
-                        isinstance(item, dict) and (
-                            item.get("type") == "image_url" or
-                            ("mime_type" in item and item["mime_type"].startswith("image/"))
+                            elif isinstance(part, dict) and "inline_data" in part:
+                                if isinstance(part["inline_data"], dict):
+                                    mime_type = part["inline_data"].get("mime_type", "")
+                                    if mime_type and mime_type.startswith("image/"):
+                                        has_image = True
+                                        break
+                    # Check for Google LLM format with 'parts' array (dict format)
+                    elif isinstance(msg, dict) and "parts" in msg and isinstance(msg["parts"], list):
+                        # Check if this message contains any images - if so, skip the entire message
+                        has_image = any(
+                            isinstance(part, dict) and
+                            "inline_data" in part and
+                            isinstance(part["inline_data"], dict) and
+                            part["inline_data"].get("mime_type", "").startswith("image/")
+                            for part in msg["parts"]
                         )
-                        for item in msg["content"]
+                    # Check for OpenAI format with content as list
+                    elif isinstance(msg, dict) and "content" in msg and isinstance(msg["content"], list):
+                        # Check if this message contains any images - if so, skip the entire message
+                        # OpenAI format: {"type": "image_url", "image_url": {"url": "..."}}
+                        has_image = any(
+                            isinstance(item, dict) and (
+                                item.get("type") == "image_url" or
+                                ("mime_type" in item and item["mime_type"].startswith("image/"))
+                            )
+                            for item in msg["content"]
+                        )
+                    # Check for simple mime_type at message level
+                    elif isinstance(msg, dict) and "mime_type" in msg and msg["mime_type"].startswith("image/"):
+                        has_image = True
+
+                    # Only add messages that don't have image content
+                    if not has_image:
+                        msgs.append(msg)
+
+                # Safeguard: Don't clear all context if we had messages before
+                # This prevents accidental full context loss due to format detection issues
+                if original_count > 0 and len(msgs) == 0:
+                    logger.warning(
+                        f"Image erasure would clear all {original_count} messages - "
+                        "this likely indicates a format detection issue. Skipping image erasure."
                     )
-                # Check for simple mime_type at message level
-                elif isinstance(msg, dict) and "mime_type" in msg and msg["mime_type"].startswith("image/"):
-                    has_image = True
+                else:
+                    if original_count != len(msgs):
+                        logger.debug(f"Image erasure: removed {original_count - len(msgs)} image messages, kept {len(msgs)}")
+                    self._context.set_messages(msgs)
 
-                # Only add messages that don't have image content
-                if not has_image:
-                    msgs.append(msg)
-
-            self._context.set_messages(msgs)
+            except Exception as e:
+                # If any unexpected error occurs during filtering, skip image erasure entirely
+                # to avoid context loss
+                logger.error(f"Unexpected error during image erasure, skipping: {e}")
 
         # Add cached image frame to context if available
         image_prompt = "[SYSTEM] if the user wants information about what the drone sees or whats in the image, use this image as context. If the user doesn't reference the image or what the drone sees, ignore it completely and just do as the user asks"
