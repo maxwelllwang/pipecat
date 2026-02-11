@@ -648,8 +648,11 @@ class LLMService(AIService):
                     )
                     await item.handler(params)
         except Exception as e:
-            error_message = f"Error executing function call [{runner_item.function_name}]: {e}"
-            logger.error(f"{self} {error_message}")
+            import traceback
+            tb_str = traceback.format_exc()
+            error_message = f"Error executing function call [{runner_item.function_name}]: {e}\n{tb_str}"
+            # Send error result back to LLM so it doesn't get stuck waiting
+            await function_call_result_callback(f"Error: {e}")
             await self.push_error(error_msg=error_message, exception=e, fatal=False)
 
     async def _cancel_function_call(self, function_name: Optional[str]):

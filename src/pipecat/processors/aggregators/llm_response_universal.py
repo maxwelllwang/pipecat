@@ -471,6 +471,7 @@ class LLMUserAggregator(LLMContextAggregator):
         if len(self._aggregation) == 0:
             return ""
 
+
         # Check if image erasure is disabled via environment variable
         disable_image_erasure = os.environ.get("DISABLE_IMAGE_ERASURE", "").lower() == "true"
 
@@ -479,6 +480,8 @@ class LLMUserAggregator(LLMContextAggregator):
             original_messages = self._context.get_messages()
             original_count = len(original_messages)
             msgs = []
+
+
 
             try:
                 for message in original_messages:
@@ -543,8 +546,10 @@ class LLMUserAggregator(LLMContextAggregator):
                         f"Image erasure would clear all {original_count} messages - "
                         "this likely indicates a format detection issue. Skipping image erasure."
                     )
+                    print(f"[CONTEXT_DEBUG] ⚠️ SAFEGUARD TRIGGERED: image erasure would clear ALL {original_count} messages, skipping")
                 else:
                     if original_count != len(msgs):
+                        print(f"[CONTEXT_DEBUG] Image erasure: {original_count} -> {len(msgs)} messages (removed {original_count - len(msgs)})")
                         logger.debug(f"Image erasure: removed {original_count - len(msgs)} image messages, kept {len(msgs)}")
                     self._context.set_messages(msgs)
 
@@ -552,6 +557,9 @@ class LLMUserAggregator(LLMContextAggregator):
                 # If any unexpected error occurs during filtering, skip image erasure entirely
                 # to avoid context loss
                 logger.error(f"Unexpected error during image erasure, skipping: {e}")
+                print(f"[CONTEXT_DEBUG] ❌ EXCEPTION during image erasure: {e}")
+                import traceback; traceback.print_exc()
+
 
         # Add cached image frame to context if available
         image_prompt = "[SYSTEM] if the user wants information about what the drone sees or whats in the image, use this image as context. If the user doesn't reference the image or what the drone sees, ignore it completely and just do as the user asks"
@@ -569,6 +577,7 @@ class LLMUserAggregator(LLMContextAggregator):
         aggregation = self.aggregation_string()
         await self.reset()
         self._context.add_message({"role": self.role, "content": aggregation})
+        print(f"[CONTEXT_DEBUG] push_aggregation END - context has {len(self._context.get_messages())} messages, pushing aggregation: '{aggregation[:100]}...'")
         await self.push_context_frame()
 
         return aggregation
