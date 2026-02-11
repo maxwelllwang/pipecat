@@ -13,6 +13,8 @@ event handling for conversational AI applications.
 
 import asyncio
 import json
+import os
+import sys
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, List, Optional
 
@@ -753,25 +755,43 @@ class LiveKitInputTransport(BaseInputTransport):
     async def _video_in_task_handler(self):
         """Handle incoming video frames from participants."""
         logger.info("Video input task started")
-        video_iterator = self._client.get_next_video_frame()
-        async for video_data in video_iterator:
-            if video_data:
-                video_frame_event, participant_id = video_data
-                pipecat_video_frame = await self._convert_livekit_video_to_pipecat(
-                    video_frame_event=video_frame_event
-                )
 
-                # Skip frames with no video data
-                if len(pipecat_video_frame.image) == 0:
-                    continue
+        # --- FD REDIRECT START ---
+        # Duplicate the original stderr so we can restore it later.
+        # This suppresses FFmpeg H264 SEI truncation warnings at the C level.
+        stderr_fd = sys.stderr.fileno()
+        saved_stderr = os.dup(stderr_fd)
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        # --- FD REDIRECT END ---
 
-                input_video_frame = UserImageRawFrame(
-                    user_id=participant_id,
-                    image=pipecat_video_frame.image,
-                    size=pipecat_video_frame.size,
-                    format=pipecat_video_frame.format,
-                )
-                await self.push_video_frame(input_video_frame)
+        try:
+            # Silence the C-level stderr for the duration of the loop
+            os.dup2(devnull, stderr_fd)
+
+            video_iterator = self._client.get_next_video_frame()
+            async for video_data in video_iterator:
+                if video_data:
+                    video_frame_event, participant_id = video_data
+                    pipecat_video_frame = await self._convert_livekit_video_to_pipecat(
+                        video_frame_event=video_frame_event
+                    )
+
+                    # Skip frames with no video data
+                    if len(pipecat_video_frame.image) == 0:
+                        continue
+
+                    input_video_frame = UserImageRawFrame(
+                        user_id=participant_id,
+                        image=pipecat_video_frame.image,
+                        size=pipecat_video_frame.size,
+                        format=pipecat_video_frame.format,
+                    )
+                    await self.push_video_frame(input_video_frame)
+        finally:
+            # --- RESTORE STDERR ---
+            os.dup2(saved_stderr, stderr_fd)
+            os.close(saved_stderr)
+            os.close(devnull)
 
     async def _convert_livekit_audio_to_pipecat(
         self, audio_frame_event: rtc.AudioFrameEvent
